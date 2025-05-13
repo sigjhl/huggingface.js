@@ -29,6 +29,8 @@ var import_node_process = require("process");
 var import_node_path = require("path");
 var import_node_os = require("os");
 const IS_TOOLS_OFF = process.env.TOOLS_OFF === 'true';
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
 
 // src/utils.ts
 var import_util = require("util");
@@ -379,7 +381,7 @@ var ENDPOINT_URL = process.env.ENDPOINT_URL ?? process.env.BASE_URL;
 //       ],
 //       env: {
 //         // Environment variables for the server process
-//         GOOGLE_API_KEY: "AIzaSyCdALs3BpV9m7Shv_SrQBlNOKuIC1vT23Q",
+//         GOOGLE_API_KEY: GOOGLE_API_KEY,
 //         GOOGLE_SEARCH_ENGINE_ID: "921d659c1c5bd4172"
 //         // NOTE: The script also adds PATH automatically later when spawning
 //       }
@@ -409,7 +411,7 @@ var SERVERS;
         command: "node",
         args: ["/Users/sigjhl/Documents/Projects/MCP/mcp-google-custom-search-server/build/index.js"],
         env: {
-          GOOGLE_API_KEY: "AIzaSyCdALs3BpV9m7Shv_SrQBlNOKuIC1vT23Q",
+          GOOGLE_API_KEY: GOOGLE_API_KEY,
           GOOGLE_SEARCH_ENGINE_ID: "921d659c1c5bd4172"
         }
       },
