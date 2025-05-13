@@ -45,6 +45,8 @@ function debug(...args) {
 var McpClient = class {
   client;
   provider;
+  clientEndpointUrl;
+  // Store endpointUrl if provided
   model;
   clients = /* @__PURE__ */ new Map();
   availableTools = [];
@@ -56,6 +58,7 @@ var McpClient = class {
   }) {
     this.client = endpointUrl ? new import_inference.InferenceClient(apiKey, { endpointUrl }) : new import_inference.InferenceClient(apiKey);
     this.provider = provider;
+    this.clientEndpointUrl = endpointUrl;
     this.model = model;
   }
   async addMcpServers(servers) {
@@ -91,14 +94,28 @@ var McpClient = class {
   }
   async *processSingleTurnWithTools(messages, opts = {}) {
     debug("start of single turn");
-    const stream = this.client.chatCompletionStream({
-      provider: this.provider,
+    const streamParams = {
       model: this.model,
       messages,
-      tools: opts.exitLoopTools ? [...opts.exitLoopTools, ...this.availableTools] : this.availableTools,
-      tool_choice: "auto",
       signal: opts.abortSignal
-    });
+      // tools and tool_choice will be added conditionally below
+    };
+    if (this.provider && !this.clientEndpointUrl) {
+      streamParams.provider = this.provider;
+    }
+    const allToolsForLLM = [];
+    if (opts.exitLoopTools && opts.exitLoopTools.length > 0) {
+      allToolsForLLM.push(...opts.exitLoopTools);
+    }
+    if (this.availableTools && this.availableTools.length > 0) {
+      allToolsForLLM.push(...this.availableTools);
+    }
+    if (allToolsForLLM.length > 0) {
+      streamParams.tools = allToolsForLLM;
+      streamParams.tool_choice = "auto";
+    }
+    debug("Calling chatCompletionStream with params:", streamParams);
+    const stream = this.client.chatCompletionStream(streamParams);
     const message = {
       role: "unknown",
       content: ""
@@ -124,10 +141,7 @@ var McpClient = class {
       }
       for (const toolCall of delta.tool_calls ?? []) {
         if (!finalToolCalls[toolCall.index]) {
-          finalToolCalls[toolCall.index] = toolCall;
-        }
-        if (finalToolCalls[toolCall.index].function.arguments === void 0) {
-          finalToolCalls[toolCall.index].function.arguments = "";
+          finalToolCalls[toolCall.index] = { ...toolCall, function: { ...toolCall.function, arguments: "" } };
         }
         if (toolCall.function.arguments) {
           finalToolCalls[toolCall.index].function.arguments += toolCall.function.arguments;
@@ -140,23 +154,32 @@ var McpClient = class {
     messages.push(message);
     for (const toolCall of Object.values(finalToolCalls)) {
       const toolName = toolCall.function.name ?? "unknown";
-      const toolArgs = toolCall.function.arguments === "" ? {} : JSON.parse(toolCall.function.arguments);
+      const toolArgsString = toolCall.function.arguments ?? "";
+      const toolArgs = toolArgsString === "" ? {} : JSON.parse(toolArgsString);
       const toolMessage = {
         role: "tool",
         tool_call_id: toolCall.id,
+        // Assuming id will always be present for a tool_call
         content: "",
         name: toolName
       };
-      if (opts.exitLoopTools?.map((t) => t.function.name).includes(toolName)) {
+      const isExitTool = opts.exitLoopTools?.some((et) => et.function.name === toolName);
+      if (isExitTool) {
         messages.push(toolMessage);
-        return yield toolMessage;
+        yield toolMessage;
+        return;
       }
       const client = this.clients.get(toolName);
       if (client) {
-        const result = await client.callTool({ name: toolName, arguments: toolArgs, signal: opts.abortSignal });
-        toolMessage.content = result.content[0].text;
+        try {
+          const result = await client.callTool({ name: toolName, arguments: toolArgs, signal: opts.abortSignal });
+          toolMessage.content = result.content[0]?.text ?? JSON.stringify(result.content);
+        } catch (e) {
+          toolMessage.content = `Error calling tool ${toolName}: ${e.message}`;
+          console.error(`Error during tool call to ${toolName}:`, e);
+        }
       } else {
-        toolMessage.content = `Error: No session found for tool: ${toolName}`;
+        toolMessage.content = `Error: No client session found for tool: ${toolName}`;
       }
       messages.push(toolMessage);
       yield toolMessage;
@@ -172,54 +195,56 @@ var McpClient = class {
 };
 
 // src/Agent.ts
-var DEFAULT_SYSTEM_PROMPT = `
-You are an agent - please keep going until the user\u2019s query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved, or if you need more info from the user to solve the problem.
-
-If you are not sure about anything pertaining to the user\u2019s request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
-
-You MUST plan extensively before each function call, and reflect extensively on the outcomes of the previous function calls. DO NOT do this entire process by making function calls only, as this can impair your ability to solve the problem and think insightfully.
-`.trim();
 var MAX_NUM_TURNS = 10;
-var taskCompletionTool = {
-  type: "function",
-  function: {
-    name: "task_complete",
-    description: "Call this tool when the task given by the user is complete",
-    parameters: {
-      type: "object",
-      properties: {}
-    }
-  }
-};
-var askQuestionTool = {
-  type: "function",
-  function: {
-    name: "ask_question",
-    description: "Ask a question to the user to get more info required to solve or clarify their problem.",
-    parameters: {
-      type: "object",
-      properties: {}
-    }
-  }
-};
-var exitLoopTools = [taskCompletionTool, askQuestionTool];
+var exitLoopTools = [];
 var Agent = class extends McpClient {
   servers;
   messages;
+  toolsOff;
   constructor({
     provider,
     endpointUrl,
     model,
     apiKey,
     servers,
-    prompt
+    prompt,
+    toolsOff
+    // Added
   }) {
     super(provider ? { provider, endpointUrl, model, apiKey } : { provider, endpointUrl, model, apiKey });
     this.servers = servers;
+    this.toolsOff = toolsOff ?? false;
+    let actualSystemPrompt;
+    if (prompt) {
+      actualSystemPrompt = prompt;
+    } else {
+      let systemPromptCore;
+      if (this.toolsOff) {
+        systemPromptCore = `You are a helpful assistant.`;
+      } else {
+        systemPromptCore = `You are a helpful assistant. 
+You must keep using tools, sequentially, until you arrive at an answer. 
+Do not be lazy. Use additional tool calls eagerly. 
+`;
+      }
+      const currentDate = /* @__PURE__ */ new Date();
+      const formattedDate = currentDate.toLocaleDateString("en-US", {
+        // Or your preferred locale
+        weekday: "long",
+        year: "numeric",
+        month: "long",
+        day: "numeric"
+      });
+      actualSystemPrompt = systemPromptCore.trim();
+      actualSystemPrompt += `
+
+Today's date is ${formattedDate}. Please use this information if the user's query is time-sensitive or implies current knowledge.`;
+      actualSystemPrompt = actualSystemPrompt.trim();
+    }
     this.messages = [
       {
         role: "system",
-        content: prompt ?? DEFAULT_SYSTEM_PROMPT
+        content: actualSystemPrompt
       }
     ];
   }
@@ -237,6 +262,7 @@ var Agent = class extends McpClient {
       try {
         yield* this.processSingleTurnWithTools(this.messages, {
           exitLoopTools,
+          // This is the empty constant from Agent.ts
           exitIfFirstChunkNoTool: numOfTurns > 0 && nextTurnShouldCallTools,
           abortSignal: opts.abortSignal
         });

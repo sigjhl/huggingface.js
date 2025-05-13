@@ -11,6 +11,7 @@ export interface ChatCompletionInputMessageTool extends ChatCompletionInputMessa
 export declare class McpClient {
     protected client: InferenceClient;
     protected provider: InferenceProviderOrPolicy | undefined;
+    private readonly clientEndpointUrl?;
     protected model: string;
     private clients;
     readonly availableTools: ChatCompletionInputTool[];

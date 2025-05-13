@@ -4,6 +4,8 @@ export declare const ANSI: {
     GRAY: string;
     GREEN: string;
     RED: string;
+    YELLOW: string;
+    CYAN: string;
     RESET: string;
 };
 //# sourceMappingURL=utils.d.ts.map

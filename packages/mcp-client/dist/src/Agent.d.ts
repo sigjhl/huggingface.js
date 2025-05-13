@@ -6,7 +6,8 @@ import type { StdioServerParameters } from "@modelcontextprotocol/sdk/client/std
 export declare class Agent extends McpClient {
     private readonly servers;
     protected messages: ChatCompletionInputMessage[];
-    constructor({ provider, endpointUrl, model, apiKey, servers, prompt, }: ({
+    private readonly toolsOff;
+    constructor({ provider, endpointUrl, model, apiKey, servers, prompt, toolsOff, }: ({
         provider: InferenceProvider;
         endpointUrl?: undefined;
     } | {
@@ -17,6 +18,7 @@ export declare class Agent extends McpClient {
         apiKey: string;
         servers: StdioServerParameters[];
         prompt?: string;
+        toolsOff?: boolean;
     });
     loadTools(): Promise<void>;
     run(input: string, opts?: {

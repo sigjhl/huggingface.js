@@ -11,5 +11,7 @@ export const ANSI = {
 	GRAY: "\x1b[90m",
 	GREEN: "\x1b[32m",
 	RED: "\x1b[31m",
+	YELLOW: "\x1b[33m", // Added
+	CYAN: "\x1b[36m",   // Added
 	RESET: "\x1b[0m",
 };

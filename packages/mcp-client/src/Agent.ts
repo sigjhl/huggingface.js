@@ -6,46 +6,23 @@ import type { ChatCompletionInputTool } from "@huggingface/tasks/src/tasks/chat-
 import type { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio";
 import { debug } from "./utils";
 
-const DEFAULT_SYSTEM_PROMPT = `
-You are an agent - please keep going until the user’s query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved, or if you need more info from the user to solve the problem.
-
-If you are not sure about anything pertaining to the user’s request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
-
-You MUST plan extensively before each function call, and reflect extensively on the outcomes of the previous function calls. DO NOT do this entire process by making function calls only, as this can impair your ability to solve the problem and think insightfully.
-`.trim();
+// Original DEFAULT_SYSTEM_PROMPT is removed as it's now dynamic
 
 /**
  * Max number of tool calling + chat completion steps in response to a single user query.
  */
 const MAX_NUM_TURNS = 10;
 
-const taskCompletionTool: ChatCompletionInputTool = {
-	type: "function",
-	function: {
-		name: "task_complete",
-		description: "Call this tool when the task given by the user is complete",
-		parameters: {
-			type: "object",
-			properties: {},
-		},
-	},
-};
-const askQuestionTool: ChatCompletionInputTool = {
-	type: "function",
-	function: {
-		name: "ask_question",
-		description: "Ask a question to the user to get more info required to solve or clarify their problem.",
-		parameters: {
-			type: "object",
-			properties: {},
-		},
-	},
-};
-const exitLoopTools = [taskCompletionTool, askQuestionTool];
+// These tools are no longer used by default as exitLoopTools is empty
+// const taskCompletionTool: ChatCompletionInputTool = { /* ... */ };
+// const askQuestionTool: ChatCompletionInputTool = { /* ... */ };
+
+const exitLoopTools: ChatCompletionInputTool[] = []; // Changed as per diff
 
 export class Agent extends McpClient {
 	private readonly servers: StdioServerParameters[];
 	protected messages: ChatCompletionInputMessage[];
+	private readonly toolsOff: boolean;
 
 	constructor({
 		provider,
@@ -54,6 +31,7 @@ export class Agent extends McpClient {
 		apiKey,
 		servers,
 		prompt,
+		toolsOff, // Added
 	}: (
 		| {
 				provider: InferenceProvider;
@@ -68,19 +46,51 @@ export class Agent extends McpClient {
 		apiKey: string;
 		servers: StdioServerParameters[];
 		prompt?: string;
+		toolsOff?: boolean; // Added
 	}) {
 		super(provider ? { provider, endpointUrl, model, apiKey } : { provider, endpointUrl, model, apiKey });
-		/// ^This shenanigan is just here to please an overzealous TS type-checker.
 		this.servers = servers;
+		this.toolsOff = toolsOff ?? false; // Default to tools ON
+
+		let actualSystemPrompt: string;
+		if (prompt) {
+			actualSystemPrompt = prompt;
+		} else {
+			let systemPromptCore: string;
+			if (this.toolsOff) {
+				systemPromptCore = `You are a helpful assistant.`;
+			} else {
+				// For Qwen, a general prompt is often best, letting the endpoint handle tool formatting.
+				// If your endpoint doesn't auto-inject Qwen's tool instructions, you might need to be more explicit here.
+				systemPromptCore = `You are a helpful assistant. 
+You must keep using tools, sequentially, until you arrive at an answer. 
+Do not be lazy. Use additional tool calls eagerly. 
+`;
+			}
+
+			const currentDate = new Date();
+			const formattedDate = currentDate.toLocaleDateString('en-US', { // Or your preferred locale
+				weekday: 'long',
+				year: 'numeric',
+				month: 'long',
+				day: 'numeric',
+			});
+			
+			actualSystemPrompt = systemPromptCore.trim();
+			actualSystemPrompt += `\n\nToday's date is ${formattedDate}. Please use this information if the user's query is time-sensitive or implies current knowledge.`;
+			actualSystemPrompt = actualSystemPrompt.trim();
+		}
+		
 		this.messages = [
 			{
 				role: "system",
-				content: prompt ?? DEFAULT_SYSTEM_PROMPT,
+				content: actualSystemPrompt,
 			},
 		];
 	}
 
 	async loadTools(): Promise<void> {
+		// If this.servers is empty (due to toolsOff), this will correctly result in no tools loaded.
 		return this.addMcpServers(this.servers);
 	}
 
@@ -97,8 +107,9 @@ export class Agent extends McpClient {
 		let nextTurnShouldCallTools = true;
 		while (true) {
 			try {
+				// exitLoopTools is now an empty array, so only this.availableTools will be passed if any
 				yield* this.processSingleTurnWithTools(this.messages, {
-					exitLoopTools,
+					exitLoopTools, // This is the empty constant from Agent.ts
 					exitIfFirstChunkNoTool: numOfTurns > 0 && nextTurnShouldCallTools,
 					abortSignal: opts.abortSignal,
 				});
@@ -109,9 +120,10 @@ export class Agent extends McpClient {
 				throw err;
 			}
 			numOfTurns++;
-			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 			const currentLast = this.messages.at(-1)!;
 			debug("current role", currentLast.role);
+			
+			// This condition will likely not be met if exitLoopTools is empty
 			if (
 				currentLast.role === "tool" &&
 				currentLast.name &&

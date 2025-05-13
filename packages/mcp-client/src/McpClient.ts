@@ -8,6 +8,7 @@ import type {
 	ChatCompletionInputTool,
 	ChatCompletionStreamOutput,
 	ChatCompletionStreamOutputDeltaToolCall,
+	// ChatCompletionStreamParams, // Removed this import
 } from "@huggingface/tasks/src/tasks/chat-completion/inference";
 import { version as packageVersion } from "../package.json";
 import { debug } from "./utils";
@@ -24,6 +25,7 @@ export interface ChatCompletionInputMessageTool extends ChatCompletionInputMessa
 export class McpClient {
 	protected client: InferenceClient;
 	protected provider: InferenceProviderOrPolicy | undefined;
+	private readonly clientEndpointUrl?: string; // Store endpointUrl if provided
 
 	protected model: string;
 	private clients: Map<ToolName, Client> = new Map();
@@ -49,6 +51,7 @@ export class McpClient {
 	}) {
 		this.client = endpointUrl ? new InferenceClient(apiKey, { endpointUrl: endpointUrl }) : new InferenceClient(apiKey);
 		this.provider = provider;
+		this.clientEndpointUrl = endpointUrl; // Store it here
 		this.model = model;
 	}
 
@@ -98,19 +101,40 @@ export class McpClient {
 	): AsyncGenerator<ChatCompletionStreamOutput | ChatCompletionInputMessageTool> {
 		debug("start of single turn");
 
-		const stream = this.client.chatCompletionStream({
-			provider: this.provider,
+		// Let TypeScript infer the type of streamParams from the method signature
+		const streamParams = {
 			model: this.model,
 			messages,
-			tools: opts.exitLoopTools ? [...opts.exitLoopTools, ...this.availableTools] : this.availableTools,
-			tool_choice: "auto",
 			signal: opts.abortSignal,
-		});
+			// tools and tool_choice will be added conditionally below
+		} as any; // Use 'as any' for now, or define a local interface if preferred
+
+		// If InferenceClient was NOT initialized with a specific endpointUrl,
+		// then we should pass the provider.
+		if (this.provider && !this.clientEndpointUrl) {
+			streamParams.provider = this.provider;
+		}
+		
+		const allToolsForLLM: ChatCompletionInputTool[] = [];
+		if (opts.exitLoopTools && opts.exitLoopTools.length > 0) {
+			allToolsForLLM.push(...opts.exitLoopTools);
+		}
+		if (this.availableTools && this.availableTools.length > 0) {
+			allToolsForLLM.push(...this.availableTools);
+		}
+
+		if (allToolsForLLM.length > 0) {
+			streamParams.tools = allToolsForLLM;
+			streamParams.tool_choice = "auto";
+		}
+		
+		debug("Calling chatCompletionStream with params:", streamParams);
+		const stream = this.client.chatCompletionStream(streamParams);
 
 		const message = {
 			role: "unknown",
 			content: "",
-		} satisfies ChatCompletionInputMessage;
+		} satisfies ChatCompletionInputMessage as ChatCompletionInputMessage & { role: "assistant" | "user" | "system" | "tool" | "unknown" };
 		const finalToolCalls: Record<number, ChatCompletionStreamOutputDeltaToolCall> = {};
 		let numOfChunks = 0;
 
@@ -126,53 +150,58 @@ export class McpClient {
 				continue;
 			}
 			if (delta.role) {
-				message.role = delta.role;
+				message.role = delta.role as "assistant" | "user" | "system" | "tool";
 			}
 			if (delta.content) {
 				message.content += delta.content;
 			}
 			for (const toolCall of delta.tool_calls ?? []) {
-				// aggregating chunks into an encoded arguments JSON object
 				if (!finalToolCalls[toolCall.index]) {
-					finalToolCalls[toolCall.index] = toolCall;
-				}
-				if (finalToolCalls[toolCall.index].function.arguments === undefined) {
-					finalToolCalls[toolCall.index].function.arguments = "";
+					finalToolCalls[toolCall.index] = { ...toolCall, function: { ...toolCall.function, arguments: "" } };
 				}
 				if (toolCall.function.arguments) {
 					finalToolCalls[toolCall.index].function.arguments += toolCall.function.arguments;
 				}
 			}
 			if (opts.exitIfFirstChunkNoTool && numOfChunks <= 2 && Object.keys(finalToolCalls).length === 0) {
-				/// If no tool is present in chunk number 1 or 2, exit.
 				return;
 			}
 		}
 
-		messages.push(message);
+		messages.push(message as ChatCompletionInputMessage);
 
 		for (const toolCall of Object.values(finalToolCalls)) {
 			const toolName = toolCall.function.name ?? "unknown";
-			/// TODO(Fix upstream type so this is always a string)^
-			const toolArgs = toolCall.function.arguments === "" ? {} : JSON.parse(toolCall.function.arguments);
+			const toolArgsString = toolCall.function.arguments ?? "";
+			const toolArgs = toolArgsString === "" ? {} : JSON.parse(toolArgsString);
 
 			const toolMessage: ChatCompletionInputMessageTool = {
 				role: "tool",
-				tool_call_id: toolCall.id,
+				tool_call_id: toolCall.id!, // Assuming id will always be present for a tool_call
 				content: "",
 				name: toolName,
 			};
-			if (opts.exitLoopTools?.map((t) => t.function.name).includes(toolName)) {
-				messages.push(toolMessage);
-				return yield toolMessage;
+
+			// Check if this tool is one of the exitLoopTools
+			const isExitTool = opts.exitLoopTools?.some(et => et.function.name === toolName);
+			if (isExitTool) {
+				messages.push(toolMessage); // Add the tool message for context
+				yield toolMessage; // Yield it so CLI can see it
+				return; // Exit the loop as per original logic if it's an exit tool
 			}
-			/// Get the appropriate session for this tool
+			
 			const client = this.clients.get(toolName);
 			if (client) {
-				const result = await client.callTool({ name: toolName, arguments: toolArgs, signal: opts.abortSignal });
-				toolMessage.content = (result.content as Array<{ text: string }>)[0].text;
+				try {
+					const result = await client.callTool({ name: toolName, arguments: toolArgs, signal: opts.abortSignal });
+					// Assuming result.content is an array with a text property, adjust if schema is different
+					toolMessage.content = (result.content as Array<{ text: string }>)[0]?.text ?? JSON.stringify(result.content);
+				} catch (e: any) {
+					toolMessage.content = `Error calling tool ${toolName}: ${e.message}`;
+					console.error(`Error during tool call to ${toolName}:`, e);
+				}
 			} else {
-				toolMessage.content = `Error: No session found for tool: ${toolName}`;
+				toolMessage.content = `Error: No client session found for tool: ${toolName}`;
 			}
 			messages.push(toolMessage);
 			yield toolMessage;
