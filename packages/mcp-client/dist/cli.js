@@ -28,6 +28,8 @@ var readline = __toESM(require("readline/promises"));
 var import_node_process = require("process");
 var import_node_path = require("path");
 var import_node_os = require("os");
+var import_node_child_process = require("child_process");
+var import_node_fs_promises = require("fs/promises");
 const IS_TOOLS_OFF = process.env.TOOLS_OFF === 'true';
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
@@ -48,6 +50,68 @@ var ANSI = {
   CYAN: "\x1B[36m", // For regular assistant responses
   RESET: "\x1B[0m"
 };
+
+// Get the appropriate editor command for the current platform
+function getEditorCommand() {
+  // First, check if EDITOR environment variable is set
+  if (process.env.EDITOR) {
+    return process.env.EDITOR;
+  }
+
+  // Otherwise, use platform-specific defaults
+  switch (process.platform) {
+    case "win32":
+      return "notepad";
+    case "darwin": // macOS
+      // Always prefer nano on macOS for the best CLI experience
+      try {
+        const result = (0, import_node_child_process.spawnSync)("which", ["nano"], { stdio: "pipe" });
+        if (result.status === 0) {
+          // Return nano with just the auto-save flag (-t) which is compatible with pico
+          return "nano -t";
+        }
+      } catch (err) {
+        // Ignore error and try other editors
+      }
+
+      // Fall back to vim or vi if nano is not available
+      try {
+        const result = (0, import_node_child_process.spawnSync)("which", ["vim"], { stdio: "pipe" });
+        if (result.status === 0) {
+          return "vim";
+        }
+      } catch (err) {
+        // Ignore error and try vi
+      }
+
+      try {
+        const result = (0, import_node_child_process.spawnSync)("which", ["vi"], { stdio: "pipe" });
+        if (result.status === 0) {
+          return "vi";
+        }
+      } catch (err) {
+        // Fall back to TextEdit
+      }
+
+      // Last resort, use TextEdit (but this is not recommended)
+      return "open -W -t";
+    default: // Linux and others
+      // Try to find a common editor in this order
+      const editors = ["nano", "vim", "vi"];
+      for (const editor of editors) {
+        try {
+          // Check if editor exists by running 'which'
+          const result = (0, import_node_child_process.spawnSync)("which", [editor], { stdio: "pipe" });
+          if (result.status === 0) {
+            return editor;
+          }
+        } catch (err) {
+          // Continue to the next editor if not found
+        }
+      }
+      return "nano"; // Default to nano if nothing else works
+  }
+}
 
 // src/McpClient.ts
 var import_client = require("@modelcontextprotocol/sdk/client/index.js");
@@ -492,6 +556,153 @@ async function main() {
         multiLineBuffer.push(nextLine);
       }
       return multiLineBuffer.join("\n");
+    } else if (initialLine.trim().toLowerCase().startsWith("!edit")) {
+      // Check for editor specification in the command
+      const editorMatch = initialLine.match(/^!edit\s+--editor\s+(\S+)\s*(.*)$/i);
+      let specifiedEditor = null;
+      let initialContent = '';
+
+      if (editorMatch) {
+        // User specified an editor with --editor flag
+        specifiedEditor = editorMatch[1];
+        initialContent = editorMatch[2] || '';
+        import_node_process.stdout.write(ANSI.BLUE + `Using specified editor: ${specifiedEditor}\n` + ANSI.RESET);
+      }
+
+      // External editor mode
+      import_node_process.stdout.write(ANSI.BLUE + "Opening editor... Please save and close the file when done.\n" + ANSI.RESET);
+
+      // Determine which editor will be used
+      const editorCommand = specifiedEditor || getEditorCommand();
+
+      // Show editor-specific instructions
+      if (editorCommand.includes("nano")) {
+        import_node_process.stdout.write(ANSI.GREEN + "Using nano editor (auto-save mode): Press Ctrl+X to save and exit when done.\n" + ANSI.RESET);
+      } else if (editorCommand === "vim" || editorCommand === "vi") {
+        import_node_process.stdout.write(ANSI.GREEN + "Using vim/vi editor: Press Escape, then :wq and Enter to save and exit.\n" + ANSI.RESET);
+      }
+
+      // Create a temporary file with a consistent name (makes it easier to recognize in the editor)
+      const tempDir = (0, import_node_os.tmpdir)();
+      const tempFileName = `mcp-client-input.txt`;
+      const tempFilePath = (0, import_node_path.join)(tempDir, tempFileName);
+
+      // Set editor mode flag and save the temp file path
+      isInEditorMode = true;
+      editorTempFilePath = tempFilePath;
+
+      try {
+        // Check if we have initial content to pre-populate the editor with
+        let initialContent = '';
+
+        // If not already set by --editor flag, check for initial content
+        if (!editorMatch) {
+          const match = initialLine.match(/^!edit\s+(.+)$/i);
+          if (match && match[1]) {
+            initialContent = match[1];
+          }
+        }
+
+        // Create the file with initial content
+        await (0, import_node_fs_promises.writeFile)(tempFilePath, initialContent, 'utf-8');
+
+        // Use the already determined editor command
+        let editorCmd, editorArgs;
+
+        // Handle special case for macOS
+        if (process.platform === "darwin") {
+          // Check if the command is the open command that launches TextEdit
+          if (editorCommand.startsWith("open") && editorCommand.includes("-t")) {
+            // Warn about potential issues with TextEdit
+            import_node_process.stdout.write(ANSI.YELLOW + "Warning: TextEdit can sometimes cause hanging issues. " +
+              "Consider setting the EDITOR environment variable to 'nano' or 'vim'.\n" + ANSI.RESET);
+            import_node_process.stdout.write(ANSI.YELLOW + "If the CLI hangs after closing TextEdit, press Ctrl+C to continue.\n" + ANSI.RESET);
+
+            editorCmd = "open";
+            editorArgs = ["-W", "-t", tempFilePath]; // -W flag waits for the app to close
+          }
+          // Check if it's another app specified with open -a
+          else if (editorCommand.startsWith("open") && editorCommand.includes("-a")) {
+            const appName = editorCommand.split("-a ")[1].trim();
+            editorCmd = "open";
+            editorArgs = ["-W", "-a", appName, tempFilePath];
+          }
+          // If it's the open command without special args
+          else if (editorCommand.startsWith("open")) {
+            editorCmd = "open";
+            editorArgs = [tempFilePath];
+          }
+          // Otherwise it's a terminal editor like nano or vim
+          else {
+            const parts = editorCommand.split(" ");
+            editorCmd = parts[0];
+            editorArgs = [...parts.slice(1), tempFilePath];
+          }
+        } else {
+          // For other editors, split the command and arguments
+          const parts = editorCommand.split(" ");
+          editorCmd = parts[0];
+          editorArgs = [...parts.slice(1), tempFilePath];
+        }
+
+        // Launch the editor and wait for it to close
+        // Set a timeout (5 minutes) to prevent the CLI from getting stuck indefinitely
+        import_node_process.stdout.write(ANSI.BLUE + "Editor session will timeout after 5 minutes if not closed.\n" + ANSI.RESET);
+
+        const editorProcess = (0, import_node_child_process.spawnSync)(editorCmd, editorArgs, {
+          stdio: "inherit", // Redirect stdio to allow the user to interact with the editor
+          timeout: 300000 // 5 minute timeout (in milliseconds)
+        });
+
+        // Check for errors in the editor process
+        if (editorProcess.error) {
+          // Handle different error types
+          if (editorProcess.error.code === 'ETIMEDOUT') {
+            import_node_process.stdout.write(ANSI.RED + `Editor session timed out after 5 minutes. Reading the file as is.\n` + ANSI.RESET);
+          } else {
+            import_node_process.stdout.write(ANSI.RED + `Error launching editor: ${editorProcess.error.message}\n` + ANSI.RESET);
+            return "";
+          }
+        }
+
+        if (editorProcess.status !== 0 && editorProcess.status !== null) {
+          import_node_process.stdout.write(ANSI.YELLOW + `Editor closed with non-zero exit code (${editorProcess.status}). Input might be incomplete.\n` + ANSI.RESET);
+        }
+
+        // Add a clear indicator that we're back in the CLI
+        import_node_process.stdout.write(ANSI.GREEN + `Editor closed. Returning to CLI...\n` + ANSI.RESET);
+
+        // Read the file content
+        const fileContent = await (0, import_node_fs_promises.readFile)(tempFilePath, 'utf-8');
+
+        // Trim trailing whitespace but preserve intentional newlines within the content
+        const trimmedContent = fileContent.trimEnd();
+
+        // Show a preview/confirmation of the content length
+        import_node_process.stdout.write(ANSI.BLUE + `Read ${trimmedContent.length} characters from editor.\n` + ANSI.RESET);
+
+        // Reset editor mode flags
+        isInEditorMode = false;
+        editorTempFilePath = null;
+
+        return trimmedContent;
+      } catch (err) {
+        import_node_process.stdout.write(ANSI.RED + `Error during edit process: ${err.message}\n` + ANSI.RESET);
+
+        // Reset editor mode flags on error
+        isInEditorMode = false;
+        editorTempFilePath = null;
+
+        return "";
+      } finally {
+        // Clean up the temporary file
+        try {
+          await (0, import_node_fs_promises.unlink)(tempFilePath);
+        } catch (unlinkErr) {
+          // Just log cleanup errors without failing
+          console.warn(`Failed to delete temporary file: ${tempFilePath}`, unlinkErr);
+        }
+      }
     } else if (initialLine.trim().toLowerCase() === "exit" || initialLine.trim().toLowerCase() === "quit") {
       return initialLine.trim().toLowerCase();
     } else {
@@ -511,8 +722,34 @@ async function main() {
   //   return input;
   // }
 
+  // Track if we're in editor mode
+  let isInEditorMode = false;
+  let editorTempFilePath = null;
+
   rl.on("SIGINT", async () => {
-    if (waitingForInput) {
+    if (isInEditorMode) {
+      // We're in editor mode, handle the interrupt
+      import_node_process.stdout.write("\n");
+      import_node_process.stdout.write(ANSI.RED);
+      import_node_process.stdout.write("Detected Ctrl+C while waiting for editor. Attempting to force exit editor mode...");
+      import_node_process.stdout.write(ANSI.RESET);
+      import_node_process.stdout.write("\n");
+
+      // Clean up temp file if it exists
+      if (editorTempFilePath) {
+        try {
+          await (0, import_node_fs_promises.unlink)(editorTempFilePath);
+        } catch (err) {
+          // Ignore errors during cleanup
+        }
+        editorTempFilePath = null;
+      }
+
+      isInEditorMode = false;
+      // Return to the prompt
+      import_node_process.stdout.write("> ");
+    }
+    else if (waitingForInput) {
       await agent.cleanup();
       import_node_process.stdout.write("\n");
       rl.close();
@@ -549,6 +786,7 @@ async function main() {
   // ADDED USER INSTRUCTIONS
   import_node_process.stdout.write(ANSI.BLUE);
   import_node_process.stdout.write("Type '!multi' to enter multiple lines, then '!end' to finish.\n");
+  import_node_process.stdout.write("Type '!edit' to open nano (just press Ctrl+X to save and exit), or '!edit text' to pre-populate it.\n");
   import_node_process.stdout.write("Type 'exit' or 'quit' to exit.\n");
   import_node_process.stdout.write(ANSI.RESET);
   import_node_process.stdout.write("\n");
